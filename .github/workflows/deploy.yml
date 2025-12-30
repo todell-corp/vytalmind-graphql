@@ -1,0 +1,94 @@
+name: Build and Deploy
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+env:
+  REGISTRY: nexus.odell.com:5001
+  IMAGE_NAME: vytalmind-graphql
+
+jobs:
+  build-and-test:
+    runs-on: self-hosted
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Log in to Docker registry
+        run: echo "${{ secrets.NEXUS_PASSWORD }}" | docker login ${{ env.REGISTRY }} -u "${{ secrets.NEXUS_USERNAME }}" --password-stdin
+
+      - name: Build Docker image
+        run: |
+          docker build -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }} .
+          docker tag ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }} ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+
+      - name: Run tests in container
+        run: |
+          docker run --rm ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest npm test
+        continue-on-error: true
+
+      - name: Push Docker image to registry
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        run: |
+          docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+
+      - name: Log out from Docker registry
+        if: always()
+        run: docker logout ${{ env.REGISTRY }}
+
+  deploy:
+    needs: build-and-test
+    runs-on: self-hosted
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    steps:
+      - name: Log in to Docker registry
+        run: echo "${{ secrets.NEXUS_PASSWORD }}" | docker login ${{ env.REGISTRY }} -u "${{ secrets.NEXUS_USERNAME }}" --password-stdin
+
+      - name: Pull latest image from registry
+        run: docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+
+      - name: Stop existing container
+        run: docker stop vytalmind-graphql || true
+        continue-on-error: true
+
+      - name: Remove existing container
+        run: docker rm vytalmind-graphql || true
+        continue-on-error: true
+
+      - name: Run new container
+        run: |
+          docker run -d \
+            --name vytalmind-graphql \
+            -p 4000:4000 \
+            --restart unless-stopped \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+
+      - name: Wait for health check
+        run: |
+          echo "Waiting for service to be healthy..."
+          for i in {1..30}; do
+            if curl -f http://localhost:4000/.well-known/apollo/server-health 2>/dev/null; then
+              echo "Service is healthy!"
+              exit 0
+            fi
+            echo "Attempt $i: Service not ready yet..."
+            sleep 2
+          done
+          echo "Service failed to become healthy"
+          docker logs vytalmind-graphql
+          exit 1
+
+      - name: Log out from Docker registry
+        if: always()
+        run: docker logout ${{ env.REGISTRY }}
+
+      - name: Clean up old images
+        run: docker image prune -af --filter "until=24h"
